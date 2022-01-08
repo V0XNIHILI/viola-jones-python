@@ -11,6 +11,11 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 
+def show_image(img: np.ndarray):
+    img = Image.fromarray(img.astype(np.uint8))
+    img.show()
+
+
 def rgb2gray(img: np.unsignedinteger) -> np.unsignedinteger:
     """
     Convert an RGB image to grayscale.
@@ -53,7 +58,7 @@ def load_cascade(path: str) -> dict:
         return json.load(json_file)["cascade"]
 
 
-def scale_nearest_neighbor(img: np.ndarray, scale: float) -> np.ndarray:
+def scale_nearest_neighbor(img: np.unsignedinteger, scale: float) -> np.unsignedinteger:
     """
     Scale an image by nearest neighbor interpolation.
 
@@ -119,9 +124,9 @@ def calc_rectangle_feature(
 
 
 def detect_objects(
-    gray_image: np.unsignedinteger,
+    gray_img: np.unsignedinteger,
     cascade: dict,
-    detector_size: int,
+    detector_size: int = 24,
     scale_factor: float = 1.25,
     delta: float = 1.5,
 ) -> List[Tuple[Tuple[int, int], int]]:
@@ -135,40 +140,38 @@ def detect_objects(
     # Loop over the scales in the image pyramid. Please note that in the original implementation as
     # proposed by Viola and Jones, the detector is scaled instead of the image.
     while (
-        gray_image.shape[0] / current_scale > detector_size
-        and gray_image.shape[1] / current_scale > detector_size
+        gray_img.shape[0] / current_scale >= detector_size
+        and gray_img.shape[1] / current_scale >= detector_size
     ):
-        current_image = scale_nearest_neighbor(gray_image, current_scale)
+        current_image = scale_nearest_neighbor(gray_img, current_scale)
         current_integral_image = integral_image(current_image)
         current_squared_integral_image = integral_image(current_image, True)
 
         # Loop over the image sub windows (i = height, j = width)
         for i in range(0, current_image.shape[0] - detector_size + 1, step_size):
             for j in range(0, current_image.shape[1] - detector_size + 1, step_size):
-                integral_window = current_integral_image[
-                    i : i + detector_size, j : j + detector_size
-                ]
-
                 # Mean and squared sum calculations are done this way as this approach can also be
                 # used in hardware.
-                mean = calc_rectangle_feature(
+
+                regular_sum = calc_rectangle_feature(
                     current_integral_image,
                     (i, j),
-                    (i + detector_size - 1, j + detector_size - 1),
+                    (i + detector_size - 2, j + detector_size - 2),
                 )
 
                 squared_sum = calc_rectangle_feature(
                     current_squared_integral_image,
                     (i, j),
-                    (i + detector_size - 1, j + detector_size - 1),
+                    (i + detector_size - 2, j + detector_size - 2),
                 )
 
-                variance = squared_sum * (detector_size ** 2) - mean ** 2
+                variance = squared_sum * (detector_size ** 2) - regular_sum ** 2
 
-                if variance < 0:
-                    variance = 1
-                else:
-                    variance = sqrt(variance)
+                # std = sqrt(true variance) * (detector_size^2); need multiplication with detector
+                # size since it will be post-applied
+                std = int(sqrt(variance))
+
+                window_left_top = np.array([i, j])
 
                 detected_face = True
 
@@ -182,19 +185,18 @@ def detect_objects(
 
                         for rectangles in feature["rectangles"]:
                             feature_sum += calc_rectangle_feature(
-                                integral_window,
-                                rectangles["left_top"],
-                                rectangles["right_bottom"],
+                                current_integral_image,
+                                window_left_top + rectangles["left_top"],
+                                window_left_top + rectangles["right_bottom"],
                                 rectangles["weight"],
                             )
 
                         # Apply variance normalization as explained in the original paper by
-                        # multiplying with the variance of the window.
-                        if feature_sum >= feature["threshold"] * variance:
+                        # multiplying with the standard deviation of the window.
+                        if feature_sum >= feature["threshold"] * std:
                             layer_sum += feature["pass_value"]
                         else:
                             layer_sum += feature["fail_value"]
-
                     if layer_sum < 0.4 * layer["threshold"]:
                         detected_face = False
                         break
@@ -227,54 +229,89 @@ def overlap_ratio(
 
     intersection_area = max(
         0,
-        min(left_top_1[1] + size_1 - 1, left_top_2[1] + size_2 - 1)
+        min(left_top_1[1] + size_1, left_top_2[1] + size_2)
         - max(left_top_1[1], left_top_2[1]),
     ) * max(
         0,
-        min(left_top_1[0] + size_1 - 1, left_top_2[0] + size_2 - 1)
+        min(left_top_1[0] + size_1, left_top_2[0] + size_2)
         - max(left_top_1[0], left_top_2[0]),
     )
+
+    if intersection_area >= size_1 ** 2 or intersection_area >= size_2 ** 2:
+        return 1
 
     union_area = size_1 ** 2 + size_2 ** 2 - intersection_area
 
     return intersection_area / union_area
 
 
+def average_detections(
+    detections: List[Tuple[Tuple[int, int], int]]
+) -> Tuple[Tuple[int, int], int]:
+    """
+    Calculate the average detection of a list of detections.
+
+    The average detection is calculated by taking the average of the left top corner of the
+    detections and the average size of the detections.
+    """
+
+    left_top = tuple(
+        np.array(
+            [
+                np.mean([detection[0][0] for detection in detections]),
+                np.mean([detection[0][1] for detection in detections]),
+            ]
+        ).astype(int)
+    )
+
+    size = int(np.mean([detection[1] for detection in detections]))
+
+    return left_top, size
+
+
 def group_objects(
-    detections: List[Tuple[Tuple[int, int], int]], overlap_threshold: float = 0.41
+    detections: List[Tuple[Tuple[int, int], int]],
+    overlap_threshold: float = 0.4,
+    min_neighbors: int = 3,
 ) -> List[Tuple[Tuple[int, int], int]]:
     """
     Group detections that are close to each other. The overlap threshold is used to determine if two
     detections are close enough to each other to be grouped together as one object.
 
     An overlap treshold of 1.0 means that two detections have to be exactly the same to be grouped,
-    a threshold of 0.5 means that they ratio of intersection area to union area has to be at least
+    a threshold of 0.5 means that the ratio of intersection area to union area has to be at least
     0.5. 0.0 means that they do not have to overlap in order to be grouped together.
     """
 
-    grouped_detections = detections.copy()
+    already_combined_detections = []
+    final_detections = []
 
-    for i, j in combinations(range(len(grouped_detections)), 2):
-        if grouped_detections[i] is None or grouped_detections[j] is None:
-            continue
+    for i in range(len(detections)):
+        overlapping_rectangles = []
 
-        if (
-            overlap_ratio(
-                detections[i][0], detections[i][1], detections[j][0], detections[j][1]
-            )
-            > overlap_threshold
-        ):
-            grouped_detections[i] = (
-                (
-                    (detections[i][0][0] + detections[j][0][0]) / 2,
-                    (detections[i][0][1] + detections[j][0][1]) / 2,
-                ),
-                (detections[i][1] + detections[j][1]) / 2,
-            )
+        for j in range(len(detections)):
+            if i != j and i not in already_combined_detections:
+                if (
+                    overlap_ratio(
+                        detections[i][0],
+                        detections[i][1],
+                        detections[j][0],
+                        detections[j][1],
+                    )
+                    > overlap_threshold
+                ):
+                    overlapping_rectangles.append(j)
 
-            grouped_detections[j] = None
+        if len(overlapping_rectangles) >= min_neighbors:
+            already_combined_detections.extend(overlapping_rectangles)
+            already_combined_detections.append(i)
 
-    return list(filter(lambda x: x is not None, grouped_detections))
+            detections_to_average = [detections[k] for k in overlapping_rectangles]
+            detections_to_average.append(detections[i])
+
+            final_detections.append(average_detections(detections_to_average))
+
+    return final_detections
 
 
 if __name__ == "__main__":
@@ -287,7 +324,7 @@ if __name__ == "__main__":
     image_array = np.array(original_image)
 
     # Factor to scale with in every scale of the image pyramid
-    scale_factor = 1.1
+    scale_factor = 1.2
 
     # Size of the detector in pixels.
     detector_size = 24
@@ -295,10 +332,9 @@ if __name__ == "__main__":
     gray_image = rgb2gray(image_array)
 
     detections = detect_objects(gray_image, cascade, detector_size, scale_factor, 1.5)
+    detections = group_objects(detections)
 
-    image_with_detections = draw_boxes_around_detections(
-        original_image, group_objects(detections)
-    )
+    image_with_detections = draw_boxes_around_detections(original_image, detections)
 
     # Show the image with the detected faces.
     image_with_detections.show()
